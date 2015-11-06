@@ -11,6 +11,7 @@
 import logging
 import oauthlib.oauth1
 import oauthlib.oauth2
+from copy import copy
 from functools import wraps
 from oauthlib.common import to_unicode, PY3, add_params_to_uri
 from flask import request, redirect, json, session, current_app
@@ -38,6 +39,7 @@ class OAuth(object):
 
         oauth = OAuth(app)
     """
+    state_key = 'oauthlib.client'
 
     def __init__(self, app=None):
         self.remote_apps = {}
@@ -56,7 +58,7 @@ class OAuth(object):
         """
         self.app = app
         app.extensions = getattr(app, 'extensions', {})
-        app.extensions['oauthlib.client'] = self
+        app.extensions[self.state_key] = self
 
     def remote_app(self, name, register=True, **kwargs):
         """Registers a new remote application.
@@ -115,7 +117,7 @@ def parse_response(resp, content, strict=False, content_type=None):
     ct, options = parse_options_header(content_type)
 
     if ct in ('application/json', 'text/javascript'):
-        if content == '':
+        if not content:
             return {}
         return json.loads(content)
 
@@ -308,7 +310,7 @@ class OAuthRemoteApp(object):
 
     @cached_property
     def access_token_method(self):
-        return self._get_property('access_token_method', 'GET')
+        return self._get_property('access_token_method', 'POST')
 
     @cached_property
     def content_type(self):
@@ -338,7 +340,7 @@ class OAuthRemoteApp(object):
     def make_client(self, token=None):
         # request_token_url is for oauth1
         if self.request_token_url:
-            params = self.request_token_params or {}
+            params = copy(self.request_token_params) or {}
             if token and isinstance(token, (tuple, list)):
                 params["resource_owner_key"] = token[0]
                 params["resource_owner_secret"] = token[1]
@@ -462,8 +464,12 @@ class OAuthRemoteApp(object):
             # change the uri, headers, or body.
             uri, headers, body = self.pre_request(uri, headers, body)
 
+        if body:
+            data = to_bytes(body, self.encoding)
+        else:
+            data = None
         resp, content = self.http_request(
-            uri, headers, data=to_bytes(body, self.encoding), method=method
+            uri, headers, data=data, method=method
         )
         return OAuthResponse(resp, content, self.content_type)
 
@@ -625,6 +631,7 @@ class OAuthRemoteApp(object):
             body = client.prepare_request_body(**remote_args)
             resp, content = self.http_request(
                 self.expand_url(self.access_token_url),
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
                 data=to_bytes(body, self.encoding),
                 method=self.access_token_method,
             )

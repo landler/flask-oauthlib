@@ -1,12 +1,17 @@
 # coding: utf-8
+
+import os
+import unittest
 from datetime import datetime, timedelta
+from flask import Flask
 from flask import g, render_template, request, jsonify, make_response
-from flask.ext.sqlalchemy import SQLAlchemy
+from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import relationship
 from flask_oauthlib.provider import OAuth2Provider
 from flask_oauthlib.contrib.oauth2 import bind_sqlalchemy
 from flask_oauthlib.contrib.oauth2 import bind_cache_grant
 
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = 'true'
 
 db = SQLAlchemy()
 
@@ -17,7 +22,7 @@ class User(db.Model):
                          nullable=False)
 
     def check_password(self, password):
-        return True
+        return password != 'wrong'
 
 
 class Client(db.Model):
@@ -27,9 +32,9 @@ class Client(db.Model):
     client_id = db.Column(db.String(40), primary_key=True)
     client_secret = db.Column(db.String(55), unique=True, index=True,
                               nullable=False)
-    client_type = db.Column(db.String(20), default='public')
     _redirect_uris = db.Column(db.Text)
     default_scope = db.Column(db.Text, default='email address')
+    disallow_grant_type = db.Column(db.String(20))
 
     @property
     def user(self):
@@ -53,8 +58,13 @@ class Client(db.Model):
 
     @property
     def allowed_grant_types(self):
-        return ['authorization_code', 'password', 'client_credentials',
-                'refresh_token']
+        types = [
+            'authorization_code', 'password',
+            'client_credentials', 'refresh_token',
+        ]
+        if self.disallow_grant_type:
+            types.remove(self.disallow_grant_type)
+        return types
 
 
 class Grant(db.Model):
@@ -130,7 +140,7 @@ def cache_provider(app):
     oauth = OAuth2Provider(app)
 
     bind_sqlalchemy(oauth, db.session, user=User,
-                    token=Token, client=Client)
+                    token=Token, client=Client, current_user=current_user)
 
     app.config.update({'OAUTH2_CACHE_TYPE': 'simple'})
     bind_cache_grant(app, oauth, current_user)
@@ -184,7 +194,10 @@ def default_provider(app):
         # In real project, a token is unique bound to user and client.
         # Which means, you don't need to create a token every time.
         tok = Token(**token)
-        tok.user_id = request.user.id
+        if request.response_type == 'token':
+            tok.user_id = g.user.id
+        else:
+            tok.user_id = request.user.id
         tok.client_id = request.client.client_id
         db.session.add(tok)
         db.session.commit()
@@ -193,62 +206,17 @@ def default_provider(app):
     def get_user(username, password, *args, **kwargs):
         # This is optional, if you don't need password credential
         # there is no need to implement this method
-        return User.query.filter_by(username=username).first()
+        user = User.query.filter_by(username=username).first()
+        if user and user.check_password(password):
+            return user
+        return None
 
     return oauth
-
-
-def prepare_app(app):
-    db.init_app(app)
-    db.app = app
-    db.create_all()
-
-    client1 = Client(
-        name='dev', client_id='dev', client_secret='dev',
-        _redirect_uris=(
-            'http://localhost:8000/authorized '
-            'http://localhost/authorized'
-        ),
-    )
-
-    client2 = Client(
-        name='confidential', client_id='confidential',
-        client_secret='confidential', client_type='confidential',
-        _redirect_uris=(
-            'http://localhost:8000/authorized '
-            'http://localhost/authorized'
-        ),
-    )
-
-    user = User(username='admin')
-
-    temp_grant = Grant(
-        user_id=1, client_id='confidential',
-        code='12345', scope='email',
-        expires=datetime.utcnow() + timedelta(seconds=100)
-    )
-
-    access_token = Token(
-        user_id=1, client_id='dev', access_token='expired', expires_in=0
-    )
-
-    try:
-        db.session.add(client1)
-        db.session.add(client2)
-        db.session.add(user)
-        db.session.add(temp_grant)
-        db.session.add(access_token)
-        db.session.commit()
-    except:
-        db.session.rollback()
-    return app
 
 
 def create_server(app, oauth=None):
     if not oauth:
         oauth = default_provider(app)
-
-    app = prepare_app(app)
 
     @app.before_request
     def load_current_user():
@@ -265,7 +233,7 @@ def create_server(app, oauth=None):
         # NOTICE: for real project, you need to require login
         if request.method == 'GET':
             # render a page for user to confirm the authorization
-            return render_template('confirm.html')
+            return 'confirm page'
 
         if request.method == 'HEAD':
             # if HEAD is supported properly, request parameters like
@@ -285,7 +253,7 @@ def create_server(app, oauth=None):
     @app.route('/oauth/revoke', methods=['POST'])
     @oauth.revoke_handler
     def revoke_token():
-        pass
+        return {}
 
     @app.route('/api/email')
     @oauth.require_oauth('email')
@@ -317,13 +285,33 @@ def create_server(app, oauth=None):
     return app
 
 
-if __name__ == '__main__':
-    from flask import Flask
-    app = Flask(__name__)
-    app.debug = True
-    app.secret_key = 'development'
-    app.config.update({
-        'SQLALCHEMY_DATABASE_URI': 'sqlite:///test.sqlite'
-    })
-    app = create_server(app)
-    app.run()
+class TestCase(unittest.TestCase):
+    def setUp(self):
+        app = self.create_app()
+
+        app.testing = True
+        self._ctx = app.app_context()
+        self._ctx.push()
+
+        db.init_app(app)
+        db.create_all()
+
+        self.app = app
+        self.client = app.test_client()
+        self.prepare_data()
+
+    def tearDown(self):
+        db.drop_all()
+        self._ctx.pop()
+
+    def prepare_data(self):
+        return True
+
+    def create_app(self):
+        app = Flask(__name__)
+        app.debug = True
+        app.secret_key = 'testing'
+        app.config.update({
+            'SQLALCHEMY_DATABASE_URI': 'sqlite://'
+        })
+        return app

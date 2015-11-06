@@ -18,7 +18,7 @@ from werkzeug import cached_property
 from werkzeug.utils import import_string
 from oauthlib import oauth2
 from oauthlib.oauth2 import RequestValidator, Server
-from oauthlib.common import to_unicode, add_params_to_uri
+from oauthlib.common import to_unicode
 from ..utils import extract_params, decode_base64, create_response
 
 __all__ = ('OAuth2Provider', 'OAuth2RequestValidator')
@@ -131,11 +131,18 @@ class OAuth2Provider(object):
         if token_generator and not callable(token_generator):
             token_generator = import_string(token_generator)
 
+        refresh_token_generator = self.app.config.get(
+            'OAUTH2_PROVIDER_REFRESH_TOKEN_GENERATOR', None
+        )
+        if refresh_token_generator and not callable(refresh_token_generator):
+            refresh_token_generator = import_string(refresh_token_generator)
+
         if hasattr(self, '_validator'):
             return Server(
                 self._validator,
                 token_expires_in=expires_in,
                 token_generator=token_generator,
+                refresh_token_generator=refresh_token_generator,
             )
 
         if hasattr(self, '_clientgetter') and \
@@ -161,6 +168,7 @@ class OAuth2Provider(object):
                 validator,
                 token_expires_in=expires_in,
                 token_generator=token_generator,
+                refresh_token_generator=refresh_token_generator,
             )
         raise RuntimeError('application not bound to required getters')
 
@@ -224,7 +232,6 @@ class OAuth2Provider(object):
 
             - client_id: A random string
             - client_secret: A random string
-            - client_type: A string represents if it is `confidential`
             - redirect_uris: A list of redirect uris
             - default_redirect_uri: One of the redirect uris
             - default_scopes: Default scopes of the client
@@ -371,8 +378,8 @@ class OAuth2Provider(object):
             server = self.server
             uri, http_method, body, headers = extract_params()
 
-            if request.method == 'GET':
-                redirect_uri = request.args.get('redirect_uri', None)
+            if request.method in ('GET', 'HEAD'):
+                redirect_uri = request.args.get('redirect_uri', self.error_uri)
                 log.debug('Found redirect_uri %s.', redirect_uri)
                 try:
                     ret = server.validate_authorization_request(
@@ -386,15 +393,12 @@ class OAuth2Provider(object):
                     return redirect(e.in_uri(self.error_uri))
                 except oauth2.OAuth2Error as e:
                     log.debug('OAuth2Error: %r', e)
-                    return redirect(e.in_uri(redirect_uri or self.error_uri))
-                except Exception as e:
-                    log.warn('Exception: %r', e)
-                    return redirect(add_params_to_uri(
-                        self.error_uri, {'error': 'unknown'}
-                    ))
+                    return redirect(e.in_uri(redirect_uri))
 
             else:
-                redirect_uri = request.values.get('redirect_uri', None)
+                redirect_uri = request.values.get(
+                    'redirect_uri', self.error_uri
+                )
 
             try:
                 rv = f(*args, **kwargs)
@@ -403,12 +407,7 @@ class OAuth2Provider(object):
                 return redirect(e.in_uri(self.error_uri))
             except oauth2.OAuth2Error as e:
                 log.debug('OAuth2Error: %r', e)
-                return redirect(e.in_uri(redirect_uri or self.error_uri))
-            except Exception as e:
-                log.warn('Exception: %r', e)
-                return redirect(add_params_to_uri(
-                    self.error_uri, {'error': 'unknown'}
-                ))
+                return redirect(e.in_uri(redirect_uri))
 
             if not isinstance(rv, bool):
                 # if is a response or redirect
@@ -448,11 +447,23 @@ class OAuth2Provider(object):
         except oauth2.OAuth2Error as e:
             log.debug('OAuth2Error: %r', e)
             return redirect(e.in_uri(redirect_uri or self.error_uri))
-        except Exception as e:
-            log.warn('Exception: %r', e)
-            return redirect(add_params_to_uri(
-                self.error_uri, {'error': 'unknown'}
-            ))
+
+    def verify_request(self, scopes):
+        """Verify current request, get the oauth data.
+
+        If you can't use the ``require_oauth`` decorator, you can fetch
+        the data in your request body::
+
+            def your_handler():
+                valid, req = oauth.verify_request(['email'])
+                if valid:
+                    return jsonify(user=req.user)
+                return jsonify(status='error')
+        """
+        uri, http_method, body, headers = extract_params()
+        return self.server.verify_request(
+            uri, http_method, body, headers, scopes
+        )
 
     def token_handler(self, f):
         """Access/refresh token handler decorator.
@@ -523,11 +534,7 @@ class OAuth2Provider(object):
                 if hasattr(request, 'oauth') and request.oauth:
                     return f(*args, **kwargs)
 
-                server = self.server
-                uri, http_method, body, headers = extract_params()
-                valid, req = server.verify_request(
-                    uri, http_method, body, headers, scopes
-                )
+                valid, req = self.verify_request(scopes)
 
                 for func in self._after_request_funcs:
                     valid, req = func(valid, req)
@@ -574,26 +581,10 @@ class OAuth2RequestValidator(RequestValidator):
         .. _`Section 4.1.3`: http://tools.ietf.org/html/rfc6749#section-4.1.3
         .. _`Section 6`: http://tools.ietf.org/html/rfc6749#section-6
         """
-
-        if request.grant_type == 'password':
-            client = self._clientgetter(request.client_id)
-            if (not client) or client.client_type == 'confidential' or\
-                    request.client_secret:
-                return True
-            else:
-                return False
-
-        auth_required = ('authorization_code', 'refresh_token')
-        return 'Authorization' in request.headers and\
-            request.grant_type in auth_required
+        grant_types = ('password', 'authorization_code', 'refresh_token')
+        return request.grant_type in grant_types
 
     def authenticate_client(self, request, *args, **kwargs):
-        """Authenticate itself in other means.
-
-        Other means means is described in `Section 3.2.1`_.
-
-        .. _`Section 3.2.1`: http://tools.ietf.org/html/rfc6749#section-3.2.1
-        """
         auth = request.headers.get('Authorization', None)
         log.debug('Authenticate client %r', auth)
         if auth:
@@ -611,18 +602,13 @@ class OAuth2RequestValidator(RequestValidator):
 
         client = self._clientgetter(client_id)
         if not client:
-            log.debug('Authenticate client failed, client not found.')
             return False
-
-        request.client = client
 
         if client.client_secret != client_secret:
             log.debug('Authenticate client failed, secret not match.')
             return False
 
-        if client.client_type != 'confidential':
-            log.debug('Authenticate client failed, not confidential.')
-            return False
+        request.client = client
         log.debug('Authenticate client success.')
         return True
 
@@ -632,8 +618,9 @@ class OAuth2RequestValidator(RequestValidator):
         :param client_id: Client ID of the non-confidential client
         :param request: The Request object passed by oauthlib
         """
-        log.debug('Authenticate client %r.', client_id)
-        client = request.client or self._clientgetter(client_id)
+        log.debug('Authenticate client id %r.', client_id)
+
+        client = self._clientgetter(client_id)
         if not client:
             log.debug('Authenticate failed, client not found.')
             return False
@@ -770,7 +757,7 @@ class OAuth2RequestValidator(RequestValidator):
             return False
 
         # validate scopes
-        if not set(tok.scopes).issuperset(set(scopes)):
+        if scopes and not set(tok.scopes) & set(scopes):
             msg = 'Bearer token scope not valid.'
             request.error_message = msg
             log.debug(msg)
