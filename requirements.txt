@@ -1,5 +1,5 @@
 Flask==0.10.1
 mock==1.3.0
 -e git://github.com/landler/oauthlib.git#egg=oauthlib
-requests-oauthlib==0.5.0
+-e git://github.com/landler/requests-oauthlib.git#egg=requests-oauthlib
 Flask-SQLAlchemy==2.0
